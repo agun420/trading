@@ -1,0 +1,10 @@
+# requirements.txt
+yfinance
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+statsmodels
+scipy
+requests
