@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Final Quantitative Trading Framework with Telegram Integration
+Final Quantitative Trading Framework with Telegram Integration (Fixed)
 
 This script is designed to be run automatically via GitHub Actions.
 It performs a full backtest and sends the performance summary and plots
@@ -8,6 +8,11 @@ to a specified Telegram chat.
 
 It accepts the Telegram Bot Token and Chat ID as command-line arguments
 to ensure credentials are not hardcoded.
+
+Change Log:
+- Fixed a KeyError for 'Adj Close' by making the data handling in DataManager
+  more robust. The script now correctly processes data whether yfinance
+  returns a single-ticker or multi-ticker DataFrame structure.
 """
 
 # @title 1. Setup and Imports
@@ -77,8 +82,28 @@ class DataManager:
         logger.info(f"Fetching data for {len(self.config.universe)} assets...")
         all_tickers = self.config.universe + [self.config.benchmark]
         raw_data = yf.download(all_tickers, start=self.config.start_date, end=self.config.end_date, progress=False, threads=True)
-        prices = raw_data['Adj Close']
         
+        if raw_data.empty:
+            logger.error("No data downloaded from yfinance. Aborting.")
+            raise ValueError("Data download failed, resulting in an empty DataFrame.")
+
+        # === FIX STARTS HERE ===
+        # This logic robustly handles both single-ticker and multi-ticker downloads
+        if isinstance(raw_data.columns, pd.MultiIndex):
+            # Standard case for multiple tickers
+            prices = raw_data['Adj Close']
+        else:
+            # Fallback for single ticker or unexpected format
+            logger.warning("Downloaded data does not have a MultiIndex. Adapting to single-ticker format.")
+            if 'Adj Close' in raw_data.columns:
+                # Reformat to look like a multi-ticker download for consistency downstream
+                prices = raw_data[['Adj Close']]
+                prices.columns = pd.MultiIndex.from_tuples([('Adj Close', all_tickers[0])])
+            else:
+                logger.error("'Adj Close' column not found in downloaded data.")
+                raise KeyError("'Adj Close' not found. yfinance data structure may have changed or download failed.")
+        # === FIX ENDS HERE ===
+
         # Validation and cleaning
         prices.fillna(method='ffill', inplace=True)
         prices.fillna(method='bfill', inplace=True)
@@ -92,6 +117,7 @@ class SignalGenerator:
     """Generates trading signals from market data."""
     def __init__(self, data_manager: DataManager):
         self.data_manager = data_manager
+        self.config = data_manager.config
 
     def generate_all_signals(self):
         prices = self.data_manager.data['prices'][self.config.universe]
@@ -145,7 +171,8 @@ class RiskManager:
         def objective(weights):
             ret = np.sum(expected_returns * weights)
             vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-            return -(ret - self.config.risk_free_rate) / vol
+            # Add a small epsilon to avoid division by zero if volatility is zero
+            return -(ret - self.config.risk_free_rate) / (vol + 1e-9)
         
         constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
         bounds = tuple((0, 1) for _ in range(num_assets))
@@ -200,7 +227,7 @@ class PerformanceAnalyzer:
         """Calculates all key performance metrics."""
         self.metrics['annual_return'] = self.returns.mean() * 252
         self.metrics['annual_volatility'] = self.returns.std() * np.sqrt(252)
-        self.metrics['sharpe_ratio'] = (self.metrics['annual_return'] - self.config.risk_free_rate) / self.metrics['annual_volatility']
+        self.metrics['sharpe_ratio'] = (self.metrics['annual_return'] - self.config.risk_free_rate) / (self.metrics['annual_volatility'] + 1e-9)
         
         cumulative_returns = (1 + self.returns).cumprod()
         running_max = cumulative_returns.expanding().max()
@@ -274,7 +301,6 @@ def send_telegram_message(token: str, chat_id: str, message: str, plot_buffer: B
         logger.info("Telegram message sent successfully.")
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to send Telegram message: {e}")
-        # Log the response content for debugging if available
         if e.response is not None:
             logger.error(f"Telegram API Response: {e.response.text}")
 
